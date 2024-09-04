@@ -21,6 +21,8 @@ import pickle
 torch.set_float32_matmul_precision('high')
 # torch.autograd.set_detect_anomaly(True)
 
+NUM_CLASSES = 11399
+
 def keep_recent(directory, num_files=5):
     files = [os.path.join(directory, f) for f in os.listdir(directory) if os.path.isfile(os.path.join(directory, f))]
     sorted_files = sorted(files, key=os.path.getmtime, reverse=True)
@@ -48,7 +50,7 @@ class Geoformer(nn.Module):
     def __init__(self):
         super().__init__()
         hidden_dim = 1536
-        self.backbone = timm.create_model('volo_d1_224', num_classes=11399, pretrained=True)
+        self.backbone = timm.create_model('volo_d1_224', num_classes=NUM_CLASSES, pretrained=True)
 
         # for p in self.backbone.parameters():
         #     p.requires_grad = False
@@ -286,7 +288,8 @@ class Trainer:
         return checkpoint['step']
 
     def validate(self):
-        quadtree_accs = []
+        top1_accs = []
+        topk_accs = []
         distances = []
 
         self.model.eval()
@@ -298,16 +301,32 @@ class Trainer:
                 targets = {key: value.to(self.device) for key, value in targets.items()}
                 outputs = self.model(inputs)
 
-                quadtree_accuracy = outputs['quadtree_10_1000'].argmax(dim=1).eq(targets['quadtree_10_1000'].argmax(dim=1)).float().mean()
+                top1_preds = outputs['quadtree_10_1000'].argmax(dim=1)
+                true_labels = targets['quadtree_10_1000'].argmax(dim=1)
+
+                top1_accuracy = top1_preds.eq(true_labels).float().mean()
+
+                _, topk_preds = outputs['quadtree_10_1000'].topk(k, dim=1)
+
+                true_labels = true_labels.view(-1, 1)
+
+                topk_correct = topk_preds.eq(true_labels).sum(dim=1).float()
+                topk_accuracy = topk_correct.mean()
+
+                top1_accs += top1_accuracy
+                topk_accs += topk_accuracy
 
                 val_dist = self.calculate_haverstine_distance(outputs, targets)
-                quadtree_accs.append(quadtree_accuracy.item())
+                top1_accs.append(top1_accuracy.item())
+                topk_accs.append(top1_accuracy.item())
                 distances.append(val_dist.item())
 
-        print(f"Validation | Distances: {np.median(distances):.2f} | Quadtree Accuracy: {np.median(quadtree_accs):.3f}")
+        print(f"Validation | Distance: {np.median(distances):.2f} | Top-1: {np.median(top1_accs):.4f} | Top-k: {np.median(topk_accs):.4f}")
 
     def test(self, step):
-        quadtree_accs = []
+        top1_accs = []
+        topk_accs = []
+        distances = []
 
         self.model.eval()
         val_progress = tqdm(self.test_dataloader, total=len(self.test_dataloader))
@@ -318,13 +337,28 @@ class Trainer:
                 targets = {key: value.to(self.device) for key, value in targets.items()}
                 outputs = self.model(inputs)
 
-                quadtree_accuracy = outputs['quadtree_10_1000'].argmax(dim=1).eq(targets['quadtree_10_1000'].argmax(dim=1)).float().mean()
+                top1_preds = outputs['quadtree_10_1000'].argmax(dim=1)
+                true_labels = targets['quadtree_10_1000'].argmax(dim=1)
 
-                quadtree_accs.append(quadtree_accuracy.item())
+                top1_accuracy = top1_preds.eq(true_labels).float().mean()
 
-        print(f"Test | Quadtree Accuracy: {np.median(quadtree_accs):.3f}")
+                _, topk_preds = outputs['quadtree_10_1000'].topk(k, dim=1)
+
+                true_labels = true_labels.view(-1, 1)
+
+                topk_correct = topk_preds.eq(true_labels).sum(dim=1).float()
+                topk_accuracy = topk_correct.mean()
+
+                top1_accs += top1_accuracy
+                topk_accs += topk_accuracy
+
+                val_dist = self.calculate_haverstine_distance(outputs, targets)
+                top1_accs.append(top1_accuracy.item())
+                topk_accs.append(top1_accuracy.item())
+                distances.append(val_dist.item())
+        print(f"Test | Top-1: {np.median(top1_accs):.4f} | Top-k: {np.median(topk_accs):.4f}")
         with open('log', 'a') as f:
-            f.write(f'{step} - {np.median(quadtree_accs) * 100}%\n')
+            f.write(f'{step:04d} | Top-1: {np.median(top1_accs) * 100:.2f}% | Top-k: {np.median(topk_accs) * 100:.2f}%\n')
 
     def train(self, starting_step=0, validate_first=False):
         current_step = starting_step
@@ -340,18 +374,33 @@ class Trainer:
 
             self.optimizer.zero_grad()
             accum_loss = 0.0
-            quadtree_accs = 0.0
+            top1_accs = 0.0
+            topk_accs = 0.0
             for _ in range(self.gradient_accumulation_steps):
                 inputs, targets = next(data_iter)
                 inputs = inputs.to(self.device)
                 targets = {key: value.to(self.device) for key, value in targets.items()}
-                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                    outputs = self.model(inputs)
-                    task_losses = self.calculate_losses(outputs, targets)
-                    quadtree_accuracy = outputs['quadtree_10_1000'].argmax(dim=1).eq(targets['quadtree_10_1000'].argmax(dim=1)).float().mean()
-                    quadtree_accs += quadtree_accuracy
-                    loss = task_losses.sum()
-                    loss /= self.gradient_accumulation_steps
+                inputs, targets['quadtree_10_1000'] = cutmix_or_mixup(inputs, targets['quadtree_10_1000'])
+                outputs = self.model(inputs)
+                task_losses = self.calculate_losses(outputs, targets)
+
+                top1_preds = outputs['quadtree_10_1000'].argmax(dim=1)
+                true_labels = targets['quadtree_10_1000'].argmax(dim=1)
+
+                top1_accuracy = top1_preds.eq(true_labels).float().mean()
+
+                _, topk_preds = outputs['quadtree_10_1000'].topk(k, dim=1)
+
+                true_labels = true_labels.view(-1, 1)
+
+                topk_correct = topk_preds.eq(true_labels).sum(dim=1).float()
+                topk_accuracy = topk_correct.mean()
+
+                top1_accs += top1_accuracy
+                topk_accs += topk_accuracy
+
+                loss = task_losses.sum()
+                loss /= self.gradient_accumulation_steps
                 loss.backward()
                 accum_loss += loss.detach()
 
@@ -372,9 +421,10 @@ class Trainer:
 
             current_step += 1
 
-            quadtree_accs /= self.gradient_accumulation_steps
+            top1_accs /= self.gradient_accumulation_steps
+            topk_accs /= self.gradient_accumulation_steps
 
-            print(f"Step: {current_step:05} | L: {accum_loss.item():.4f} | QA: {quadtree_accs.item():.4f} | norm: {norm:.4f} | dt: {dt * 1000:.2f}ms | img/sec: {images_per_sec:.2f}")
+            print(f"Step: {current_step:05} | L: {accum_loss.item():.4f} | Top-1: {top1_accs.item():.4f} | Top-k: {topk_accs.item():.4f} | norm: {norm:.4f} | dt: {dt * 1000:.2f}ms | img/sec: {images_per_sec:.2f}")
 
             if (current_step + 1) % 1000 == 0:
                 self.save_checkpoint(current_step + 1)
@@ -432,7 +482,7 @@ class LMDBDataset(Dataset):
         metadata_dict = {
             'longitude': torch.tensor(lon_relative, dtype=torch.float32),
             'latitude': torch.tensor(lat_relative, dtype=torch.float32),
-            'quadtree_10_1000': F.one_hot(torch.tensor(cluster_id), num_classes=11399).float()
+            'quadtree_10_1000': F.one_hot(torch.tensor(cluster_id), num_classes=NUM_CLASSES).float()
         }
 
         return {'image': torch.tensor(img, dtype=torch.float32), **metadata_dict}
@@ -488,19 +538,19 @@ class ImageDataset(Dataset):
         metadata_dict = {
             'longitude': torch.tensor(lon_relative, dtype=torch.float32),
             'latitude': torch.tensor(lat_relative, dtype=torch.float32),
-            'quadtree_10_1000': F.one_hot(torch.tensor(cluster_id), num_classes=11399).float()
+            'quadtree_10_1000': torch.tensor(cluster_id, dtype=torch.int64)
         }
 
         return {'image': image, **metadata_dict}
-
-def labels_getter(batch):
-    print(batch)
-    return batch['quadtree_10_1000']
 
 def custom_collate(batch):
     images = torch.stack([item['image'] for item in batch])
     other_data = {key: torch.stack([item[key] for item in batch]) for key in batch[0] if key != 'image'}
     return images, other_data
+
+cutmix = T.CutMix(num_classes=NUM_CLASSES)
+mixup = T.MixUp(num_classes=NUM_CLASSES)
+cutmix_or_mixup = T.RandomChoice([cutmix, mixup])
 
 from PIL import ImageFilter, ImageOps
 import random
@@ -589,7 +639,7 @@ if __name__ == "__main__":
     train_dataset = ImageDataset(f'{dataset_root}/images/train', f'{dataset_root}/train_extras_removed.csv', quadtree_data, train_transform())
     test_dataset = ImageDataset(f'{dataset_root}/images/test', f'{dataset_root}/test.csv', quadtree_data, val_transform())
 
-    # train_size = int(0.99 * len(train_dataset))
+    # train_size = int(4.99 * len(train_dataset))
     # val_size = len(train_dataset) - train_size
 
     # train_dataset, val_dataset = random_split(train_dataset, [train_size, val_size])
