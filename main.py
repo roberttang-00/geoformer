@@ -31,121 +31,45 @@ def keep_recent(directory, num_files=5):
     for file in sorted_files[num_files:]:
         os.remove(file)
 
-class GeM(nn.Module):
-    def __init__(self, p=3, eps=1e-6):
-        super(GeM,self).__init__()
-        self.p = nn.Parameter(torch.ones(1)*p)
-        self.eps = eps
-
-    def forward(self, x):
-        return self.gem(x, p=self.p, eps=self.eps)
-
-    def gem(self, x, p=3, eps=1e-6):
-        return F.avg_pool2d(x.clamp(min=eps).pow(p), (x.size(-2), x.size(-1))).pow(1./p)
-
-    def __repr__(self):
-        return self.__class__.__name__ + '(' + 'p=' + '{:.4f}'.format(self.p.data.tolist()[0]) + ', ' + 'eps=' + str(self.eps) + ')'
-
 class Geoformer(nn.Module):
     def __init__(self):
         super().__init__()
-        hidden_dim = 1536
-        self.backbone = timm.create_model('volo_d1_224', num_classes=NUM_CLASSES, pretrained=True)
+        self.backbone = timm.create_model('volo_d3_224', pretrained=True, features_only=True)
 
-        # for p in self.backbone.parameters():
-        #     p.requires_grad = False
+        feature_dims = self.backbone.feature_info.channels()
 
-        # in_features = self._get_dim()
-        # feature_maps = self.backbone.feature_info.channels()
-        # print(f"dim: {in_features}")
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
 
-        # self.fusion = MultiScaleFeatureFusion(feature_maps, hidden_dim)
+        total_dim = sum(feature_dims)
 
-        # self.global_context = GlobalContextModule(hidden_dim)
+        self.shared_fc = nn.Sequential(
+            nn.Linear(total_dim, 1024),
+            nn.LayerNorm(1024),
+            nn.SiLU(),
+            nn.Dropout(0.1)
+        )
 
-        # self.gem_pooling = GeM()
-
-        # self.quadtree_classifier = nn.Sequential(
-        #     nn.Linear(hidden_dim, hidden_dim),
-        #     nn.LayerNorm(hidden_dim),
-        #     nn.GELU(),
-        #     nn.Dropout(0.1),
-        #     nn.Linear(hidden_dim, 11399)
-        # )
-
-        # self.lat_lon = nn.Linear(hidden_dim, 2)
-
-    def _get_dim(self):
-        samp = torch.rand(1, 3, 224, 224)
-        with torch.no_grad():
-            out = self.backbone(samp)
-        return out[0].shape[1]
+        self.quadtree_classifier = nn.Linear(1024, 11399)
+        self.lat_lon_regressor = nn.Linear(1024, 2)
 
     def forward(self, x):
-        x = self.backbone(x)
-        # fused_features = self.fusion(features)
-
-        # # Apply global context
-        # context_features = self.global_context(fused_features)
-
-        # # Global average pooling
-        # pooled_features = self.gem_pooling(context_features).squeeze(-1).squeeze(-1)
-
-        # # Quadtree prediction
-        # quadtree_logits = self.quadtree_classifier(pooled_features)
-
-        # lat_lon = self.lat_lon(pooled_features)
+        features = self.backbone(x)
+        
+        pooled_features = [self.global_pool(fmap).view(fmap.size(0), -1) for fmap in features]
+        
+        concat_features = torch.cat(pooled_features, dim=1)
+        
+        shared_representation = self.shared_fc(concat_features)
+        
+        quadtree_output = self.quadtree_classifier(shared_representation)
+        lat_lon_output = self.lat_lon_regressor(shared_representation)
 
         outputs = {
-            "quadtree_10_1000": x,
-            # "latitude": lat_lon[:, 0],
-            # "longitude": lat_lon[:, 1],
+            "quadtree_10_1000": quadtree_output,
+            "latitude": lat_lon_output[:, 0],
+            "longitude": lat_lon_output[:, 1],
         }
         return outputs
-
-class MultiScaleFeatureFusion(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.conv_layers = nn.ModuleList([
-            nn.Conv2d(in_ch, out_channels // len(in_channels), kernel_size=1, bias=False)
-            for in_ch in in_channels
-        ])
-        self.fusion_conv = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
-        self.norm = nn.BatchNorm2d(out_channels)
-        self.activation = nn.GELU()
-
-    def forward(self, features):
-        target_size = features[-1].shape[-2:]
-        resized_features = [
-            self.conv_layers[i](F.adaptive_avg_pool2d(feat, target_size))
-            for i, feat in enumerate(features)
-        ]
-
-        fused = torch.cat(resized_features, dim=1)
-        fused = self.fusion_conv(fused)
-        fused = self.norm(fused)
-        return self.activation(fused)
-
-class GlobalContextModule(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.attention = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(dim, dim // 16, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(dim // 16, dim, kernel_size=1),
-            nn.Sigmoid()
-        )
-        self.conv = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
-        self.norm = nn.BatchNorm2d(dim)
-        self.act = nn.GELU()
-
-    def forward(self, x):
-        attention = self.attention(x)
-        x = x * attention
-        x = self.conv(x)
-        x = self.norm(x)
-        return self.act(x)
 
 class FAMO:
     def __init__(
@@ -199,15 +123,15 @@ class Trainer:
 
         self.gradient_accumulation_steps = 8
 
-        self.max_lr = 1.5e-3
-        self.min_lr = self.max_lr * 0.1
+        self.base_lr = 1.5e-3
+        self.min_lr = self.base_lr * 0.1
         self.max_steps = self.epochs * len(self.dataloader) // self.gradient_accumulation_steps
         self.warmup_steps = int(self.max_steps * 0.10)
 
         print(f'steps per epoch: {len(self.dataloader) // self.gradient_accumulation_steps}')
         print(f'total steps: {self.max_steps}')
 
-        self.base_optimizer = optim.RAdam(self.model.parameters(), lr=self.max_lr)
+        self.base_optimizer = optim.RAdam(self.model.parameters(), lr=self.base_lr)
         self.optimizer = optim.Lookahead(self.base_optimizer)
 
         def inspect_optimizer_groups(optimizer):
@@ -228,7 +152,15 @@ class Trainer:
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
     def get_lr(self, it):
-        return self.max_lr
+        transition_step = int(self.max_steps * 0.75)
+        if it < transition_step:
+            return self.base_lr
+        else:
+            decay_steps = self.max_steps - transition_step
+            cosine_decay = 0.5 * (1 + math.cos(math.pi * (it - transition_step) / decay_steps))
+            lr = self.min_lr + (self.base_lr - self.min_lr) * cosine_decay
+            lr = max(lr, self.min_lr)
+            return lr
         if it < self.warmup_steps:
             return self.max_lr * (it + 1) / self.warmup_steps
         if it > self.max_steps:
@@ -274,7 +206,7 @@ class Trainer:
 
     def load_checkpoint(self, checkpoint_path):
         checkpoint = torch.load(checkpoint_path, weights_only=True)
-        state_dict = checkpoint['model_state_dict']
+        # state_dict = checkpoint['model_state_dict']
         # not_in = []
         # for n, p in self.model.named_parameters():
         #     if 'backbone' in n:
@@ -406,9 +338,9 @@ class Trainer:
 
             # scaler.unscale_(self.optimizer)
             norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
-            # lr = self.get_lr(current_step)
-            # for param_group in self.optimizer.param_groups:
-            #     param_group['lr'] = lr
+            lr = self.get_lr(current_step)
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = lr
             # scaler.step(self.optimizer)
             # scaler.update()
             self.optimizer.step()
@@ -424,7 +356,7 @@ class Trainer:
             top1_accs /= self.gradient_accumulation_steps
             topk_accs /= self.gradient_accumulation_steps
 
-            print(f"Step: {current_step:05} | L: {accum_loss.item():.4f} | Top-1: {top1_accs.item():.4f} | Top-k: {topk_accs.item():.4f} | norm: {norm:.4f} | dt: {dt * 1000:.2f}ms | img/sec: {images_per_sec:.2f}")
+            print(f"Step: {current_step:05} | L: {accum_loss.item():.4f} | Top-1: {top1_accs.item():.4f} | Top-k: {topk_accs.item():.4f} | lr: {lr:.4f} | norm: {norm:.4f} | dt: {dt * 1000:.2f}ms | img/sec: {images_per_sec:.2f}")
 
             if (current_step + 1) % 1000 == 0:
                 self.save_checkpoint(current_step + 1)
