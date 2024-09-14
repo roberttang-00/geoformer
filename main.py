@@ -14,7 +14,6 @@ from tqdm import tqdm
 import pandas as pd
 from PIL import Image
 import math
-import lmdb
 import pickle
 
 # torch.use_deterministic_algorithms(True)
@@ -123,7 +122,7 @@ class Trainer:
 
         self.gradient_accumulation_steps = 8
 
-        self.base_lr = 1.5e-3
+        self.base_lr = 3e-4
         self.min_lr = self.base_lr * 0.1
         self.max_steps = self.epochs * len(self.dataloader) // self.gradient_accumulation_steps
         self.warmup_steps = int(self.max_steps * 0.10)
@@ -238,7 +237,7 @@ class Trainer:
 
                 top1_accuracy = top1_preds.eq(true_labels).float().mean()
 
-                _, topk_preds = outputs['quadtree_10_1000'].topk(k, dim=1)
+                _, topk_preds = outputs['quadtree_10_1000'].topk(5, dim=1)
 
                 true_labels = true_labels.view(-1, 1)
 
@@ -270,19 +269,16 @@ class Trainer:
                 outputs = self.model(inputs)
 
                 top1_preds = outputs['quadtree_10_1000'].argmax(dim=1)
-                true_labels = targets['quadtree_10_1000'].argmax(dim=1)
+                true_labels = F.one_hot(targets['quadtree_10_1000'], num_classes=NUM_CLASSES).argmax(dim=1)
 
                 top1_accuracy = top1_preds.eq(true_labels).float().mean()
 
-                _, topk_preds = outputs['quadtree_10_1000'].topk(k, dim=1)
+                _, topk_preds = outputs['quadtree_10_1000'].topk(5, dim=1)
 
                 true_labels = true_labels.view(-1, 1)
 
                 topk_correct = topk_preds.eq(true_labels).sum(dim=1).float()
                 topk_accuracy = topk_correct.mean()
-
-                top1_accs += top1_accuracy
-                topk_accs += topk_accuracy
 
                 val_dist = self.calculate_haverstine_distance(outputs, targets)
                 top1_accs.append(top1_accuracy.item())
@@ -313,15 +309,16 @@ class Trainer:
                 inputs = inputs.to(self.device)
                 targets = {key: value.to(self.device) for key, value in targets.items()}
                 inputs, targets['quadtree_10_1000'] = cutmix_or_mixup(inputs, targets['quadtree_10_1000'])
-                outputs = self.model(inputs)
-                task_losses = self.calculate_losses(outputs, targets)
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    outputs = self.model(inputs)
+                    task_losses = self.calculate_losses(outputs, targets)
 
                 top1_preds = outputs['quadtree_10_1000'].argmax(dim=1)
                 true_labels = targets['quadtree_10_1000'].argmax(dim=1)
 
                 top1_accuracy = top1_preds.eq(true_labels).float().mean()
 
-                _, topk_preds = outputs['quadtree_10_1000'].topk(k, dim=1)
+                _, topk_preds = outputs['quadtree_10_1000'].topk(5, dim=1)
 
                 true_labels = true_labels.view(-1, 1)
 
@@ -336,13 +333,10 @@ class Trainer:
                 loss.backward()
                 accum_loss += loss.detach()
 
-            # scaler.unscale_(self.optimizer)
             norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
             lr = self.get_lr(current_step)
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = lr
-            # scaler.step(self.optimizer)
-            # scaler.update()
             self.optimizer.step()
 
             torch.cuda.synchronize()
@@ -365,59 +359,6 @@ class Trainer:
 
             if (current_step + 1) % 5000 == 0:
                 self.test(current_step + 1)
-
-class LMDBDataset(Dataset):
-    def __init__(self, lmdb_path, quadtree_data):
-        self.env = lmdb.open(lmdb_path, readonly=True, lock=False, readahead=False, meminit=False)
-        self.txn = self.env.begin(write=False)
-        self.length = 500000
-        self.quadtree_data = quadtree_data
-        self.cluster_metadata = quadtree_data.set_index('cluster_id')[['mean_lat', 'mean_lon', 'min_lat', 'min_lon', 'max_lat', 'max_lon']].to_dict('index')
-
-    def __len__(self):
-        return self.length
-
-    def __getitem__(self, index):
-        data = self.txn.get(f'{index}'.encode())
-        data = pickle.loads(data)
-
-        img = data['image']
-        latitude = data['latitude']
-        longitude = data['longitude']
-        quadtree = data['quadtree_10_1000']
-
-        cluster_id = int(quadtree)
-        qt_metadata = self.cluster_metadata[cluster_id]
-
-        lat = float(latitude)
-        lon = float(longitude)
-
-        lat_mean = qt_metadata['mean_lat']
-        lon_mean = qt_metadata['mean_lon']
-
-        lat_min = qt_metadata['min_lat']
-        lon_min = qt_metadata['min_lon']
-
-        lat_max = qt_metadata['max_lat']
-        lon_max = qt_metadata['max_lon']
-
-        lat_range = lat_max - lat_min
-        lat_relative = (lat - lat_mean) / (lat_range / 2)
-
-        lon_range = lon_max - lon_min
-        lon_relative = (lon - lon_mean) / (lon_range / 2)
-
-        lat_relative = max(-1, min(1, lat_relative))
-        lon_relative = max(-1, min(1, lon_relative))
-
-
-        metadata_dict = {
-            'longitude': torch.tensor(lon_relative, dtype=torch.float32),
-            'latitude': torch.tensor(lat_relative, dtype=torch.float32),
-            'quadtree_10_1000': F.one_hot(torch.tensor(cluster_id), num_classes=NUM_CLASSES).float()
-        }
-
-        return {'image': torch.tensor(img, dtype=torch.float32), **metadata_dict}
 
 class ImageDataset(Dataset):
     def __init__(self, img_dir, csv_file, quadtree_data, transform=None, id_column='id'):
@@ -538,7 +479,7 @@ def train_transform():
     return T.Compose([
         T.RandomResizedCrop(224),
         T.RandomHorizontalFlip(),
-        T.RandomChoice([gray_scale(p=1.0), Solarization(p=1.0), GaussianBlur(p=1.0)]),
+        T.RandomChoice([T.Identity(), gray_scale(p=1.0), Solarization(p=1.0), GaussianBlur(p=1.0)]),
         T.PILToTensor(),
         T.ToDtype(torch.float32, scale=True)
     ])
@@ -568,7 +509,7 @@ if __name__ == "__main__":
     # train_dataset = LMDBDataset(f'dataset_lmdb', quadtree_data)
     # test_dataset = LMDBDataset(f'{dataset_root}/images/test/test_db', quadtree_data, train_transform())
 
-    train_dataset = ImageDataset(f'{dataset_root}/images/train', f'{dataset_root}/train_extras_removed.csv', quadtree_data, train_transform())
+    train_dataset = ImageDataset(f'{dataset_root}/images/train', f'{dataset_root}/train.csv', quadtree_data, train_transform())
     test_dataset = ImageDataset(f'{dataset_root}/images/test', f'{dataset_root}/test.csv', quadtree_data, val_transform())
 
     # train_size = int(4.99 * len(train_dataset))
@@ -576,8 +517,8 @@ if __name__ == "__main__":
 
     # train_dataset, val_dataset = random_split(train_dataset, [train_size, val_size])
 
-    batch_size = 64
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, collate_fn=custom_collate, pin_memory=True, drop_last=True, prefetch_factor=2)
+    batch_size = 196
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, collate_fn=custom_collate, pin_memory=True, drop_last=True, prefetch_factor=8)
     # val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, collate_fn=custom_collate)
     test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=8, collate_fn=custom_collate, pin_memory=True, drop_last=True, prefetch_factor=2)
 
@@ -592,12 +533,12 @@ if __name__ == "__main__":
         # val_dataloader=val_dataloader,
         test_dataloader=test_dataloader,
         device=device,
-        epochs=100,
+        epochs=5,
         log_dir='logs/openworld_training',
         checkpoint_dir='checkpoints/openworld_model'
     )
 
-    # step = trainer.load_checkpoint('checkpoints/openworld_model/checkpoint_159000.pth')
+    step = trainer.load_checkpoint('checkpoints/openworld_model/checkpoint_12000.pth')
     # trainer.test(step)
 
-    trainer.train()
+    trainer.train(step)
